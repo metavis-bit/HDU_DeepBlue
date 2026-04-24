@@ -1,0 +1,32 @@
+# IDE
+.idea/
+.vscode/launch.json
+
+# EIDE
+Project/.eide.usr.ctx.json
+Project/.eide/log/
+
+# Keil / EIDE build outputs
+Project/Objects/
+Project/Listings/
+Project/build/
+Project/DebugConfig/
+Project/JLinkLog.txt
+Project/JLinkSettings.ini
+Project/*.log
+Project/*.lock
+Project/STM32.uvguix.*
+Project/*.uvguix.*
+
+# Binary / intermediate
+*.axf
+*.hex
+*.map
+*.o
+*.d
+*.crf
+*.lst
+*.dep
+*.htm
+*.lnp
+*.Bak
