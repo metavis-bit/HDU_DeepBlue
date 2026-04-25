@@ -30,3 +30,6 @@ Project/*.uvguix.*
 *.htm
 *.lnp
 *.Bak
+# VSCode / Keil logs
+Project/.vscode/*.log
+Project/.vscode/*.lock
