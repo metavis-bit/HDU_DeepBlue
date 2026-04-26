@@ -9,20 +9,6 @@
             "problemMatcher": []
         },
         {
-            "label": "flash",
-            "type": "shell",
-            "command": "${command:eide.project.uploadToDevice}",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "build and flash",
-            "type": "shell",
-            "command": "${command:eide.project.buildAndFlash}",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
             "label": "rebuild",
             "type": "shell",
             "command": "${command:eide.project.rebuild}",
@@ -34,6 +20,52 @@
             "type": "shell",
             "command": "${command:eide.project.clean}",
             "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "EIDE local flash - not used now",
+            "type": "shell",
+            "command": "${command:eide.project.uploadToDevice}",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "1 Upload HEX to Raspberry",
+            "type": "shell",
+            "command": "scp",
+            "args": [
+                "${workspaceFolder}\\build\\Demo\\STM32.hex",
+                "pi3:/home/metavis/Desktop/deepblue_for_PI/STM32.hex"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "2 Flash STM32 via Raspberry JLink",
+            "type": "shell",
+            "command": "ssh",
+            "args": [
+                "pi3",
+                "JLinkExe -CommandFile /home/metavis/Desktop/deepblue_for_PI/flash_stm32.jlink"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "Wireless Flash STM32 via Raspberry JLink",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "1 Upload HEX to Raspberry",
+                "2 Flash STM32 via Raspberry JLink"
+            ],
+            "problemMatcher": []
+        },
+        {
+            "label": "Build and Wireless Flash STM32",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "build",
+                "1 Upload HEX to Raspberry",
+                "2 Flash STM32 via Raspberry JLink"
+            ],
             "problemMatcher": []
         }
     ]
