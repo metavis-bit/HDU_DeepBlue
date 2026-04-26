@@ -23,6 +23,7 @@ virtualFolder:
             - path: ../Apply/Task/Src/task_irq.c
             - path: ../Apply/Task/Src/task_sysinit.c
             - path: ../Apply/Task/Src/task_userinit.c
+            - path: ../Apply/Task/Src/task_thruster.c
           folders: []
     - name: Bsp
       files: []
