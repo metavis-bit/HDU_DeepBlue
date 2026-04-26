@@ -557,7 +557,12 @@ void Drv_PWM_Init(tagPWM_T *_tPWM, uint8_t _ucNum)
 {
 	uint8_t index;
 
-    s_ucpCheckCache = (uint8_t *)calloc(0,24);
+    s_ucpCheckCache = (uint8_t *)calloc(24, sizeof(uint8_t));
+    if(s_ucpCheckCache == NULL)
+    {
+        Drv_HAL_Error(__FILE__, __LINE__);
+        return;
+    }
 	
 	for(index = 0;index < _ucNum;index++)
 	{

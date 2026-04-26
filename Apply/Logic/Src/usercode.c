@@ -24,6 +24,9 @@ uint8_t tx_buf[150];         // 发送缓冲区
 // 前向声明（定义在文件后部）
 static float NormalizeAngle(float angle);
 static float AngleDifference(float target, float current);
+static void NormalizeCommand(char *command);
+static uint8_t CommandEquals(const char *expected);
+static void thruster_all_stop(void);
 
 // ====================== 运动开启标志 ======================
 uint8_t forward_open_flag = 0;        // 直行开启标志
@@ -32,6 +35,11 @@ uint8_t rotate_180_open_flag = 0;     // 180度旋转开启标志
 // ====================== 目标角度 ======================
 float forward_yaw_target = 0.0f;      // 直行目标偏航角
 float turn_180_target = 0.0f;         // 180度右转目标角度
+
+// ====================== TURN180 串口闭环追踪 ======================
+#define TURN180_TIMEOUT_MS  10000U                // TURN180 超时上限（ms）
+static uint8_t  turn180_serial_active = 0;        // 1=由串口 TURN180 触发，需回 DONE/ERR
+static uint32_t turn180_start_tick    = 0U;       // TURN180 启动时刻
 
 
 /* 用户主逻辑函数 */
@@ -57,6 +65,22 @@ void UserLogic_Code(void)
             jy901_yaw_anti_rotate_open();
         }
 
+        // 2.1 TURN180 串口模式：自然完成 → 回 DONE TURN180
+        //     PID 完成时会调用 jy901_yaw_anti_rotation_cancel() 清零 rotate_180_open_flag
+        if(turn180_serial_active == 1 && rotate_180_open_flag == 0)
+        {
+            turn180_serial_active = 0;
+            printf("DONE TURN180 %.2f\r\n", JY901S.stcAngle.ConYaw);
+        }
+        // 2.2 TURN180 串口模式：超时 → 强制水平停止 + 回 ERR TURN180 TIMEOUT
+        else if(turn180_serial_active == 1 &&
+                (HAL_GetTick() - turn180_start_tick) > TURN180_TIMEOUT_MS)
+        {
+            jy901_yaw_anti_rotation_cancel();
+            turn180_serial_active = 0;
+            printf("ERR TURN180 TIMEOUT\r\n");
+        }
+
         // 3. 执行直线行驶（带偏航角稳向）
         if(forward_open_flag == 1)
         {
@@ -71,51 +95,126 @@ void UserLogic_Code(void)
 // 树莓派指令解析函数
 void thruster_start_open(void)
 {
+    NormalizeCommand((char *)RaspberryPi_data);
+
+/*-----------------------------------ASCII 控制命令-----------------------------------*/
+    // 串口连通性测试
+    if(CommandEquals("PING"))
+    {
+        printf("ACK PING\r\n");
+        return;
+    }
+    // 全停止：6 个推进器全部归 1500
+    if(CommandEquals("STOP") || CommandEquals("ALL_STOP"))
+    {
+        thruster_all_stop();
+        forward_open_flag = 0;
+        rotate_180_open_flag = 0;
+        turn180_serial_active = 0;
+        printf("ACK STOP\r\n");
+        return;
+    }
+    // 仅水平停止
+    if(CommandEquals("H_STOP"))
+    {
+        turn180_serial_active = 0;
+        jy901_yaw_anti_rotation_cancel();
+        thruster_horizontal_stop();
+        printf("ACK H_STOP\r\n");
+        return;
+    }
+    // 仅垂直停止
+    if(CommandEquals("V_STOP"))
+    {
+        thruster_vertical_stop();
+        printf("ACK V_STOP\r\n");
+        return;
+    }
+    // 查询当前 yaw（角度，−180~180）
+    if(CommandEquals("GET_YAW"))
+    {
+        printf("YAW %.2f\r\n", JY901S.stcAngle.ConYaw);
+        return;
+    }
+    // 闭环 180 度转向：以当前 yaw 为基准，旋转到 yaw+180
+    if(CommandEquals("TURN180"))
+    {
+        forward_open_flag = 0;
+        jy901_yaw_anti_rotation_cancel();   // 重置任何水平动作
+        rotate_180_open_flag = 1;           // 启动 PID 闭环 180 度旋转
+        turn180_serial_active = 1;          // 标记串口模式，需回 DONE/ERR
+        turn180_start_tick = HAL_GetTick();
+        printf("ACK TURN180\r\n");
+        return;
+    }
+    // 取消 TURN180：水平停止
+    if(CommandEquals("TURN180_CANCEL"))
+    {
+        turn180_serial_active = 0;
+        jy901_yaw_anti_rotation_cancel();
+        thruster_horizontal_stop();
+        printf("ACK TURN180_CANCEL\r\n");
+        return;
+    }
+
 /*-----------------------------------垂直方向控制-----------------------------------*/
     // 垂直向上
-    if(strcmp((char *)RaspberryPi_data,"JSB 3 Press") == 0)
+    if(CommandEquals("JSB 3 Press"))
     {
         thruster_vertical_up();
     }
     // 垂直停止
-    else if(strcmp((char *)RaspberryPi_data,"JSB 3 Release") == 0)
+    else if(CommandEquals("JSB 3 Release") || CommandEquals("JSB 0 Release"))
     {
         thruster_vertical_stop();
     }
     // 垂直向下
-    else if(strcmp((char *)RaspberryPi_data,"JSB 0 Press") == 0)
+    else if(CommandEquals("JSB 0 Press"))
     {
         thruster_vertical_down();
     }
 
 /*-----------------------------------水平方向控制-----------------------------------*/
     // 水平直走（带稳向）
-    else if(strcmp((char *)RaspberryPi_data,"JSB 7 Press") == 0)
+    else if(CommandEquals("JSB 7 Press"))
     {
+        turn180_serial_active = 0;
         jy901_yaw_anti_rotation_cancel();  // 先关闭其他稳向功能
         forward_open_flag = 1;             // 开启直行标志
     }
-    // 右转180度掉头
-    else if(strcmp((char *)RaspberryPi_data,"JSB 5 Press") == 0)
+    // 水平后退
+    else if(CommandEquals("JSB 4 Press"))
     {
-        jy901_yaw_anti_rotation_cancel();  // 先关闭其他稳向功能
-        rotate_180_open_flag = 1;          // 开启180度旋转标志
-    }
-
-    // 停止直行
-    else if(strcmp((char *)RaspberryPi_data,"JSB 7 Release") == 0)
-    {
+        turn180_serial_active = 0;
         jy901_yaw_anti_rotation_cancel();
+        thruster_horizontal_backward();
     }
-
-    // 左转
-    else if(strcmp((char *)RaspberryPi_data,"JSB 6 Press") == 0)
+    // 普通右转（不再触发 180 度闭环；TURN180 改为 ASCII 命令）
+    else if(CommandEquals("JSB 5 Press"))
     {
+        turn180_serial_active = 0;
+        jy901_yaw_anti_rotation_cancel();
+        thruster_horizontal_right_turn();
+    }
+    // 左转
+    else if(CommandEquals("JSB 6 Press"))
+    {
+        turn180_serial_active = 0;
         jy901_yaw_anti_rotation_cancel();
         thruster_horizontal_left_turn();
     }
+    // 水平方向各 Release：水平停止
+    else if(CommandEquals("JSB 7 Release") ||
+            CommandEquals("JSB 4 Release") ||
+            CommandEquals("JSB 5 Release") ||
+            CommandEquals("JSB 6 Release"))
+    {
+        turn180_serial_active = 0;
+        jy901_yaw_anti_rotation_cancel();
+        thruster_horizontal_stop();
+    }
     // 全推进器向下测试
-    else if(strcmp((char *)RaspberryPi_data,"JSB 11 Press") == 0)
+    else if(CommandEquals("JSB 11 Press"))
     {
         Drv_PWM_HighLvTimeSet(&thruster[0],1750);
         Drv_PWM_HighLvTimeSet(&thruster[1],1750);
@@ -123,6 +222,10 @@ void thruster_start_open(void)
         Drv_PWM_HighLvTimeSet(&thruster[3],1750);
         Drv_PWM_HighLvTimeSet(&thruster[4],1750);
         Drv_PWM_HighLvTimeSet(&thruster[5],1750);
+    }
+    else if(CommandEquals("JSB 11 Release"))
+    {
+        thruster_all_stop();
     }
 }
 
@@ -171,8 +274,8 @@ void jy901_yaw_anti_forward_open(void)
 // 角度归一化：限制在 [-180, 180]
 static float NormalizeAngle(float angle)
 {
-    if(angle > 180.0f) angle -= 360.0f;
-    if(angle < -180.0f) angle += 360.0f;
+    while(angle > 180.0f) angle -= 360.0f;
+    while(angle <= -180.0f) angle += 360.0f;
     return angle;
 }
 
@@ -180,9 +283,54 @@ static float NormalizeAngle(float angle)
 static float AngleDifference(float target, float current)
 {
     float diff = target - current;
-    if(diff > 180.0f) diff -= 360.0f;
-    if(diff < -180.0f) diff += 360.0f;
+    while(diff > 180.0f) diff -= 360.0f;
+    while(diff <= -180.0f) diff += 360.0f;
     return diff;
+}
+
+static void NormalizeCommand(char *command)
+{
+    char *start = command;
+    size_t len;
+
+    while(*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n')
+    {
+        start++;
+    }
+
+    if(start != command)
+    {
+        memmove(command, start, strlen(start) + 1);
+    }
+
+    len = strlen(command);
+    while(len > 0)
+    {
+        char tail = command[len - 1];
+        if(tail != ' ' && tail != '\t' && tail != '\r' && tail != '\n')
+        {
+            break;
+        }
+        command[len - 1] = '\0';
+        len--;
+    }
+}
+
+static uint8_t CommandEquals(const char *expected)
+{
+    return strcmp((char *)RaspberryPi_data, expected) == 0;
+}
+
+static void thruster_all_stop(void)
+{
+    uint8_t i;
+
+    for(i = 0; i < 6; i++)
+    {
+        Drv_PWM_HighLvTimeSet(&thruster[i], 1500);
+    }
+
+    jy901_yaw_anti_rotation_cancel();
 }
 
 // 180度旋转主函数

@@ -666,6 +666,19 @@ void Drv_Uart_IT_RxHandler(tagUART_T *_tUART, uint8_t _ucEndChar)
 */
 void Drv_Uart_DMA_RxHandler(tagUART_T *_tUART)
 {
+	if((__HAL_UART_GET_FLAG(&_tUART->tUARTHandle, UART_FLAG_PE)  != RESET) ||
+	   (__HAL_UART_GET_FLAG(&_tUART->tUARTHandle, UART_FLAG_FE)  != RESET) ||
+	   (__HAL_UART_GET_FLAG(&_tUART->tUARTHandle, UART_FLAG_NE)  != RESET) ||
+	   (__HAL_UART_GET_FLAG(&_tUART->tUARTHandle, UART_FLAG_ORE) != RESET))
+	{
+		/* Clear sticky UART errors by reading SR then DR, otherwise IRQ can re-enter forever. */
+		__HAL_UART_CLEAR_PEFLAG(&_tUART->tUARTHandle);
+		HAL_UART_DMAStop(&_tUART->tUARTHandle);
+		_tUART->tRxInfo.usDMARxLength = 0;
+		_tUART->tRxInfo.ucDMARxCplt = 0;
+		while(HAL_UART_Receive_DMA(&_tUART->tUARTHandle,_tUART->tRxInfo.ucpDMARxCache,_tUART->tRxInfo.usDMARxMAXSize) != HAL_OK);
+		return;
+	}
 	/* 空闲中断标记被置位 */
 	if(__HAL_UART_GET_FLAG(&_tUART->tUARTHandle,UART_FLAG_IDLE) != RESET) 
 	{
