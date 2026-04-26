@@ -21,6 +21,10 @@ uint8_t rotate_180_ready_count = 0;  // 180度旋转到位稳定计数
 
 uint8_t tx_buf[150];         // 发送缓冲区
 
+// 前向声明（定义在文件后部）
+static float NormalizeAngle(float angle);
+static float AngleDifference(float target, float current);
+
 // ====================== 运动开启标志 ======================
 uint8_t forward_open_flag = 0;        // 直行开启标志
 uint8_t rotate_180_open_flag = 0;     // 180度旋转开启标志
@@ -122,247 +126,133 @@ void thruster_start_open(void)
     }
 }
 
-// ====================== 角度归一化 & 最短路径差值 ======================
-// 归一化到 [-180, 180]
-static float NormalizeAngle(float angle)
-{
-    while(angle > 180.0f)  angle -= 360.0f;
-    while(angle < -180.0f) angle += 360.0f;
-    return angle;
-}
-
-// 目标 - 当前（最短路径）
-static float AngleDifference(float target, float current)
-{
-    float diff = target - current;
-    while(diff > 180.0f)  diff -= 360.0f;
-    while(diff < -180.0f) diff += 360.0f;
-    return diff;
-}
-
-// 偏航角稳向直行函数（位置式PID + 环绕安全 + 积分分离 + 斜率限幅）
+// 偏航角稳向直行函数（基础推力1250，PID自动纠偏）
 void jy901_yaw_anti_forward_open(void)
 {
-    // —— 可调参数 ——
-    const float DEAD_ZONE       = 0.8f;    // 死区（度）
-    const float INT_SEPARATION  = 12.0f;   // 积分分离阈值（度）
-    const float LARGE_ERROR     = 25.0f;   // 大偏差阈值（度）
-    const float INT_MAX         = 250.0f;  // 积分限幅
-    const int   OUT_MAX_SMALL   = 120;     // 小偏差时输出上限
-    const int   OUT_MAX_LARGE   = 220;     // 大偏差时输出上限（留出恢复能力）
-    const int   MIN_EFFECTIVE   = 30;      // ESC 死区补偿
-    const int   SLEW_RATE       = 18;      // 每周期最大变化量，防止抖动
-
-    static float integral     = 0.0f;
-    static float last_error   = 0.0f;
-    static int   last_output  = 0;
-    static uint8_t large_err_latch = 0;    // 大偏差锁存，用于退出时重置
-
-    // 首次进入：锁定目标偏航角
+    // 第一步：首次进入，记录当前偏航角作为直行目标角
     if(forward_yaw_get_flag == 0)
     {
         forward_yaw_target = JY901S.stcAngle.ConYaw;
         forward_yaw_get_flag = 1;
-        integral = 0.0f;
-        last_error = 0.0f;
-        last_output = 0;
-        large_err_latch = 0;
-        PID_Clear(&PID);
+        PID_Clear(&PID);  // 清空PID
     }
 
-    yaw_current = JY901S.stcAngle.ConYaw;
-
-    // 【关键】用最短路径差值计算误差，彻底解决 ±180° 跳变
-    // error 正 → 当前相对目标偏"顺时针"（与原代码符号一致: current - target）
-    float error    = -AngleDifference(forward_yaw_target, yaw_current);
-    float abs_err  = fabs(error);
-
-    // —— 死区：小扰动下不动作，但维持状态连续性 ——
-    if(abs_err < DEAD_ZONE)
+    // 第二步：循环进行角度闭环控制
+    if(forward_yaw_get_flag == 1)
     {
-        integral *= 0.95f;     // 缓慢泄放积分，避免稳态残余
-        last_error = error;
-        // 平滑收敛到 0，避免突变
-        if(last_output > SLEW_RATE)       last_output -= SLEW_RATE;
-        else if(last_output < -SLEW_RATE) last_output += SLEW_RATE;
-        else                              last_output  = 0;
-        left_offset  = last_output;
-        right_offset = -last_output;
-        forward_adjust(left_offset, right_offset);
-        return;
-    }
+        yaw_current = JY901S.stcAngle.ConYaw;
 
-    // —— 大偏差事件：首次进入时清除历史，避免旧状态污染 ——
-    if(abs_err > LARGE_ERROR)
-    {
-        if(!large_err_latch)
+        // 最短路径角度差，正确处理 ±180° 跨越
+        float angle_diff = AngleDifference(forward_yaw_target, yaw_current);
+
+        // 死区防抖
+        if(fabs(angle_diff) < 0.5f)
         {
-            integral = 0.0f;           // 抗积分饱和
-            last_error = error;        // 重置微分参考，防止微分项爆冲
-            large_err_latch = 1;
+            forward_adjust(0, 0);
+            return;
         }
+
+        // 位置式PID：以归一化角度差为输入，输出绝对纠偏量，避免累积漂移
+        yaw_output = PID_Location_Calculate(&PID, 0.0f, angle_diff);
+
+        // 最小有效偏移，避免死区
+        if(yaw_output > 0 && yaw_output < 35)
+            yaw_output = 35;
+        else if(yaw_output < 0 && yaw_output > -35)
+            yaw_output = -35;
+
+        left_offset = yaw_output;
+        right_offset = -yaw_output;
+        forward_adjust(left_offset, right_offset);
     }
-    else
-    {
-        large_err_latch = 0;
-    }
-
-    // —— 积分分离：仅在误差较小时积分，防止 windup ——
-    if(abs_err < INT_SEPARATION)
-    {
-        integral += error;
-        if(integral >  INT_MAX) integral =  INT_MAX;
-        if(integral < -INT_MAX) integral = -INT_MAX;
-    }
-    else
-    {
-        integral *= 0.85f;  // 大误差时缓慢衰减积分
-    }
-
-    // —— 位置式 PID（使用 config.c 中的 Kp/Ki/Kd）——
-    float derivative = error - last_error;
-    last_error = error;
-
-    float p_term = PID.fKp * error;
-    float i_term = PID.fKi * integral;
-    float d_term = PID.fKd * derivative;
-
-    int output = (int)(p_term + i_term + d_term);
-
-    // —— 动态输出限幅：大偏差给更大修正权限，但仍受控 ——
-    int out_max = (abs_err > LARGE_ERROR) ? OUT_MAX_LARGE : OUT_MAX_SMALL;
-    if(output >  out_max) output =  out_max;
-    if(output < -out_max) output = -out_max;
-
-    // —— 斜率限幅：防止输出突变造成抖动/振荡 ——
-    int delta = output - last_output;
-    if(delta >  SLEW_RATE) output = last_output + SLEW_RATE;
-    if(delta < -SLEW_RATE) output = last_output - SLEW_RATE;
-    last_output = output;
-
-    // —— ESC 死区补偿 ——
-    if(output > 0 && output <  MIN_EFFECTIVE) output =  MIN_EFFECTIVE;
-    if(output < 0 && output > -MIN_EFFECTIVE) output = -MIN_EFFECTIVE;
-
-    yaw_output   = output;
-    left_offset  = output;
-    right_offset = -output;
-    forward_adjust(left_offset, right_offset);
 }
 
-// 180度旋转主函数（位置式PID + 环绕安全 + 三段式速度规划）
+// ====================== 【核心实现】180度右转闭环控制 ======================
+// 角度归一化：限制在 [-180, 180]
+static float NormalizeAngle(float angle)
+{
+    if(angle > 180.0f) angle -= 360.0f;
+    if(angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
+// 计算目标角与当前角的最短路径差值
+static float AngleDifference(float target, float current)
+{
+    float diff = target - current;
+    if(diff > 180.0f) diff -= 360.0f;
+    if(diff < -180.0f) diff += 360.0f;
+    return diff;
+}
+
+// 180度旋转主函数
 void jy901_yaw_anti_rotate_open(void)
 {
-    // —— 可调参数 ——
-    const float TARGET_TOLERANCE = 1.0f;   // 到位容限（度）
-    const float SLOW_ANGLE       = 20.0f;  // 临近目标减速区（度）
-    const float CREEP_ANGLE      = 5.0f;   // 精定位爬行区（度）
-    const int   MIN_OFFSET       = 55;     // ESC 死区补偿
-    const int   MAX_OFFSET       = 260;    // 转弯最大推力
-    const int   SLOW_OFFSET      = 90;     // 减速段输出
-    const int   CREEP_OFFSET     = 60;     // 爬行段输出
-    const int   SLEW_RATE        = 25;     // 斜率限幅
-    const float INT_SEPARATION   = 20.0f;  // 积分分离阈值
-    const float INT_MAX          = 200.0f;
-    const uint8_t STABLE_COUNT   = 3;
+    const float ROTATE_180_TARGET_TOLERANCE = 1.0f;   // 目标角度容限：±1度停止
+    const float ROTATE_180_SLOW_ANGLE = 15.0f;        // 临近目标15度时减速
+    const int ROTATE_180_MIN_OFFSET = 50;             // PWM最小有效偏移（防死区）
+    const int ROTATE_180_MAX_OFFSET = 200;            // PWM最大偏移限制，增强转弯力度
+    const uint8_t ROTATE_180_STABLE_COUNT = 2;        // 稳定2次即停止
 
-    static float integral    = 0.0f;
-    static float last_error  = 0.0f;
-    static int   last_output = 0;
-    static float rotate_direction = 0.0f;  // 初始旋转方向（锁定，防止近端震荡切向）
-
-    // 【第一步】初始化：锁定目标角和初始旋转方向
+    // 【第一步】初始化：只执行一次，记录旋转180度后的目标角度
     if(right_rotate_180_get_flag == 0)
     {
         float current_yaw = JY901S.stcAngle.ConYaw;
         turn_180_target = NormalizeAngle(current_yaw + 180.0f);
-        // 锁定初始旋转方向（右转为负，左转为正），避免到达附近时 180° 跳边切换方向
-        float init_diff = AngleDifference(turn_180_target, current_yaw);
-        rotate_direction = (init_diff >= 0.0f) ? 1.0f : -1.0f;
-
         PID_Clear(&PID);
         right_rotate_180_get_flag = 1;
         rotate_180_ready_count = 0;
-        integral = 0.0f;
-        last_error = 0.0f;
-        last_output = 0;
-        forward_open_flag = 0;
+        forward_open_flag = 0;  // 确保关闭直行
     }
 
-    yaw_current = JY901S.stcAngle.ConYaw;
-
-    // 环绕安全误差: error 正 → 当前相对目标偏"顺时针"，需要向左修正
-    float angle_diff = AngleDifference(turn_180_target, yaw_current);
-    float error      = -angle_diff;
-    float abs_err    = fabs(angle_diff);
-
-    // —— 到达目标：逐步停止 ——
-    if(abs_err <= TARGET_TOLERANCE)
+    // 【第二步】循环执行PID角度闭环
+    if(right_rotate_180_get_flag == 1)
     {
-        rotate_180_ready_count++;
-        rotate_180_adjust(0, 0);
-        last_output = 0;
-        integral = 0.0f;
-        if(rotate_180_ready_count >= STABLE_COUNT)
+        yaw_current = JY901S.stcAngle.ConYaw;
+        float angle_diff = AngleDifference(turn_180_target, yaw_current);
+
+        // 已到达目标角度：停止推进器
+        if(fabs(angle_diff) <= ROTATE_180_TARGET_TOLERANCE)
         {
-            jy901_yaw_anti_rotation_cancel();
+            rotate_180_ready_count++;
+            rotate_180_adjust(0, 0);
+            if(rotate_180_ready_count >= ROTATE_180_STABLE_COUNT)
+            {
+                jy901_yaw_anti_rotation_cancel();
+                return;
+            }
+            return;
         }
-        return;
+
+        rotate_180_ready_count = 0;
+
+        // 位置式PID：以归一化角度差为输入，避免 ±180° 跨越时误差突变
+        yaw_output = PID_Location_Calculate(&PID, 0.0f, angle_diff);
+
+        // 输出限幅，避免死区与超调
+        if(yaw_output > 0 && yaw_output < ROTATE_180_MIN_OFFSET)
+            yaw_output = ROTATE_180_MIN_OFFSET;
+        else if(yaw_output < 0 && yaw_output > -ROTATE_180_MIN_OFFSET)
+            yaw_output = -ROTATE_180_MIN_OFFSET;
+
+        if(yaw_output > ROTATE_180_MAX_OFFSET)
+            yaw_output = ROTATE_180_MAX_OFFSET;
+        else if(yaw_output < -ROTATE_180_MAX_OFFSET)
+            yaw_output = -ROTATE_180_MAX_OFFSET;
+
+        // 临近目标时减速
+        if(fabs(angle_diff) < ROTATE_180_SLOW_ANGLE)
+        {
+            if(yaw_output > ROTATE_180_MIN_OFFSET)
+                yaw_output = ROTATE_180_MIN_OFFSET;
+            else if(yaw_output < -ROTATE_180_MIN_OFFSET)
+                yaw_output = -ROTATE_180_MIN_OFFSET;
+        }
+
+        left_offset = (int)yaw_output;
+        right_offset = -left_offset;
+        rotate_180_adjust(left_offset, right_offset);
     }
-    rotate_180_ready_count = 0;
-
-    // —— 积分分离 ——
-    if(abs_err < INT_SEPARATION)
-    {
-        integral += error;
-        if(integral >  INT_MAX) integral =  INT_MAX;
-        if(integral < -INT_MAX) integral = -INT_MAX;
-    }
-    else
-    {
-        integral = 0.0f;
-    }
-
-    // —— 位置式 PID ——
-    float derivative = error - last_error;
-    last_error = error;
-
-    int output = (int)(PID.fKp * error + PID.fKi * integral + PID.fKd * derivative);
-
-    // —— 三段式速度规划：远程全力 / 中程减速 / 近程爬行 ——
-    int target_output;
-    if(abs_err > SLOW_ANGLE)
-    {
-        // 远程：PID 主导，限幅到 MAX
-        if(output >  MAX_OFFSET) output =  MAX_OFFSET;
-        if(output < -MAX_OFFSET) output = -MAX_OFFSET;
-        target_output = output;
-    }
-    else if(abs_err > CREEP_ANGLE)
-    {
-        // 中程：固定减速量，方向由锁存方向决定（防近端方向抖动）
-        target_output = (int)(rotate_direction * SLOW_OFFSET);
-    }
-    else
-    {
-        // 近程：爬行定位，小步慢调
-        target_output = (int)(rotate_direction * CREEP_OFFSET);
-    }
-
-    // —— 斜率限幅 ——
-    int delta = target_output - last_output;
-    if(delta >  SLEW_RATE) target_output = last_output + SLEW_RATE;
-    if(delta < -SLEW_RATE) target_output = last_output - SLEW_RATE;
-    last_output = target_output;
-
-    // —— ESC 死区补偿 ——
-    if(target_output > 0 && target_output <  MIN_OFFSET) target_output =  MIN_OFFSET;
-    if(target_output < 0 && target_output > -MIN_OFFSET) target_output = -MIN_OFFSET;
-
-    yaw_output   = target_output;
-    left_offset  = target_output;
-    right_offset = -target_output;
-    rotate_180_adjust(left_offset, right_offset);
 }
 
 // 关闭所有稳向功能，停止电机
