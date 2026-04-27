@@ -24,9 +24,65 @@ uint8_t tx_buf[150];         // 发送缓冲区
 // 前向声明（定义在文件后部）
 static float NormalizeAngle(float angle);
 static float AngleDifference(float target, float current);
+static float AbsFloat(float value);
+static float GetYawDeg(void);
 static void NormalizeCommand(char *command);
 static uint8_t CommandEquals(const char *expected);
+static void UartPollAndParse(void);
+static void MotionUpdate(void);
 static void thruster_all_stop(void);
+static void horizontal_stop(void);
+static void vertical_stop(void);
+static void start_forward(void);
+static void start_backward(void);
+static void start_left(void);
+static void start_right(void);
+static void start_up(void);
+static void start_down(void);
+static void start_turn180(void);
+static void update_turn180(void);
+static void forward_yaw_hold_silent(void);
+static void turn180_drive_silent(float abs_err);
+static void turn_by_pwm_silent(uint8_t turn_right, int pwm_delta);
+
+typedef enum
+{
+    H_IDLE = 0,
+    H_FORWARD,
+    H_BACKWARD,
+    H_LEFT,
+    H_RIGHT,
+    H_TURN180
+} HorizontalMode;
+
+typedef enum
+{
+    V_IDLE = 0,
+    V_UP,
+    V_DOWN
+} VerticalMode;
+
+#define H_ACTION_MAX_MS           60000U
+#define V_ACTION_MAX_MS           15000U
+#define TURN180_TIMEOUT_MS        10000U
+#define TURN180_DONE_DEG          8.0f
+#define TURN180_SLOW_DEG          45.0f
+#define TURN180_DONE_HOLD_MS      350U
+#define TURN180_ROTATE_RIGHT      1
+#define TURN180_MIN_DELTA_PWM     70
+#define TURN180_MAX_DELTA_PWM     260
+#define FORWARD_USE_YAW_HOLD      1
+#define FORWARD_LEFT_PWM          1720
+#define FORWARD_RIGHT_PWM         1720
+#define FORWARD_DEADBAND_DEG      3.0f
+#define FORWARD_ADAPT_KP_START    2.0f
+#define FORWARD_ADAPT_KP_MIN      0.8f
+#define FORWARD_ADAPT_KP_MAX      5.5f
+#define FORWARD_MAX_CORR_PWM      100
+#define FORWARD_CORR_STEP_PWM     8
+#define FORWARD_POS_ERR_TURN_RIGHT 1
+#define FORWARD_MIN_PWM           1450
+#define FORWARD_MAX_PWM           1850
 
 // ====================== 运动开启标志 ======================
 uint8_t forward_open_flag = 0;        // 直行开启标志
@@ -36,10 +92,14 @@ uint8_t rotate_180_open_flag = 0;     // 180度旋转开启标志
 float forward_yaw_target = 0.0f;      // 直行目标偏航角
 float turn_180_target = 0.0f;         // 180度右转目标角度
 
-// ====================== TURN180 串口闭环追踪 ======================
-#define TURN180_TIMEOUT_MS  10000U                // TURN180 超时上限（ms）
-static uint8_t  turn180_serial_active = 0;        // 1=由串口 TURN180 触发，需回 DONE/ERR
-static uint32_t turn180_start_tick    = 0U;       // TURN180 启动时刻
+// ====================== 串口动作状态 ======================
+static HorizontalMode h_mode = H_IDLE;
+static VerticalMode v_mode = V_IDLE;
+static uint32_t h_start_tick = 0U;
+static uint32_t v_start_tick = 0U;
+static float turn180_start_yaw = 0.0f;
+static float turn180_target_yaw = 0.0f;
+static uint32_t turn180_done_tick = 0U;
 
 
 /* 用户主逻辑函数 */
@@ -49,45 +109,8 @@ void UserLogic_Code(void)
 
     while(1)
     {
-        // 清空接收缓冲区
-        memset(RaspberryPi_data, 0, sizeof(RaspberryPi_data));
-
-        // 1. 串口DMA接收树莓派指令
-        num = Drv_Uart_Receive_DMA(&Uart1, RaspberryPi_data);
-        if (num > 0)
-        {
-            thruster_start_open();  // 解析树莓派指令
-        }
-
-        // 2. 执行180度旋转
-        if(rotate_180_open_flag == 1)
-        {
-            jy901_yaw_anti_rotate_open();
-        }
-
-        // 2.1 TURN180 串口模式：自然完成 → 回 DONE TURN180
-        //     PID 完成时会调用 jy901_yaw_anti_rotation_cancel() 清零 rotate_180_open_flag
-        if(turn180_serial_active == 1 && rotate_180_open_flag == 0)
-        {
-            turn180_serial_active = 0;
-            printf("DONE TURN180 %.2f\r\n", JY901S.stcAngle.ConYaw);
-        }
-        // 2.2 TURN180 串口模式：超时 → 强制水平停止 + 回 ERR TURN180 TIMEOUT
-        else if(turn180_serial_active == 1 &&
-                (HAL_GetTick() - turn180_start_tick) > TURN180_TIMEOUT_MS)
-        {
-            jy901_yaw_anti_rotation_cancel();
-            turn180_serial_active = 0;
-            printf("ERR TURN180 TIMEOUT\r\n");
-        }
-
-        // 3. 执行直线行驶（带偏航角稳向）
-        if(forward_open_flag == 1)
-        {
-            jy901_yaw_anti_forward_open();
-        }
-
-        // 喂狗（看门狗）
+        UartPollAndParse();
+        MotionUpdate();
         Drv_IWDG_Feed(&demoIWDG);
     }
 }
@@ -98,134 +121,120 @@ void thruster_start_open(void)
     NormalizeCommand((char *)RaspberryPi_data);
 
 /*-----------------------------------ASCII 控制命令-----------------------------------*/
-    // 串口连通性测试
     if(CommandEquals("PING"))
     {
         printf("ACK PING\r\n");
         return;
     }
-    // 全停止：6 个推进器全部归 1500
+
     if(CommandEquals("STOP") || CommandEquals("ALL_STOP"))
     {
         thruster_all_stop();
-        forward_open_flag = 0;
-        rotate_180_open_flag = 0;
-        turn180_serial_active = 0;
         printf("ACK STOP\r\n");
         return;
     }
-    // 仅水平停止
+
     if(CommandEquals("H_STOP"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_stop();
+        horizontal_stop();
         printf("ACK H_STOP\r\n");
         return;
     }
-    // 仅垂直停止
+
     if(CommandEquals("V_STOP"))
     {
-        thruster_vertical_stop();
+        vertical_stop();
         printf("ACK V_STOP\r\n");
         return;
     }
-    // 查询当前 yaw（角度，−180~180）
+
     if(CommandEquals("GET_YAW"))
     {
-        printf("YAW %.2f\r\n", JY901S.stcAngle.ConYaw);
+        printf("YAW %.2f\r\n", GetYawDeg());
         return;
     }
-    // 闭环 180 度转向：以当前 yaw 为基准，旋转到 yaw+180
+
     if(CommandEquals("TURN180"))
     {
-        forward_open_flag = 0;
-        jy901_yaw_anti_rotation_cancel();   // 重置任何水平动作
-        rotate_180_open_flag = 1;           // 启动 PID 闭环 180 度旋转
-        turn180_serial_active = 1;          // 标记串口模式，需回 DONE/ERR
-        turn180_start_tick = HAL_GetTick();
-        printf("ACK TURN180\r\n");
+        start_turn180();
         return;
     }
-    // 取消 TURN180：水平停止
+
     if(CommandEquals("TURN180_CANCEL"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_stop();
+        horizontal_stop();
         printf("ACK TURN180_CANCEL\r\n");
         return;
     }
 
 /*-----------------------------------垂直方向控制-----------------------------------*/
-    // 垂直向上
     if(CommandEquals("JSB 3 Press"))
     {
-        thruster_vertical_up();
+        start_up();
+        printf("ACK JSB 3 Press\r\n");
     }
-    // 垂直停止
     else if(CommandEquals("JSB 3 Release") || CommandEquals("JSB 0 Release"))
     {
-        thruster_vertical_stop();
+        vertical_stop();
+        printf("ACK V_RELEASE\r\n");
     }
-    // 垂直向下
     else if(CommandEquals("JSB 0 Press"))
     {
-        thruster_vertical_down();
+        start_down();
+        printf("ACK JSB 0 Press\r\n");
     }
 
 /*-----------------------------------水平方向控制-----------------------------------*/
-    // 水平直走（带稳向）
     else if(CommandEquals("JSB 7 Press"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();  // 先关闭其他稳向功能
-        forward_open_flag = 1;             // 开启直行标志
+        start_forward();
+        printf("ACK JSB 7 Press\r\n");
     }
-    // 水平后退
     else if(CommandEquals("JSB 4 Press"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_backward();
+        start_backward();
+        printf("ACK JSB 4 Press\r\n");
     }
-    // 普通右转（不再触发 180 度闭环；TURN180 改为 ASCII 命令）
     else if(CommandEquals("JSB 5 Press"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_right_turn();
+        start_right();
+        printf("ACK JSB 5 Press\r\n");
     }
-    // 左转
     else if(CommandEquals("JSB 6 Press"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_left_turn();
+        start_left();
+        printf("ACK JSB 6 Press\r\n");
     }
-    // 水平方向各 Release：水平停止
     else if(CommandEquals("JSB 7 Release") ||
             CommandEquals("JSB 4 Release") ||
             CommandEquals("JSB 5 Release") ||
             CommandEquals("JSB 6 Release"))
     {
-        turn180_serial_active = 0;
-        jy901_yaw_anti_rotation_cancel();
-        thruster_horizontal_stop();
+        horizontal_stop();
+        printf("ACK H_RELEASE\r\n");
     }
-    // 全推进器向下测试
     else if(CommandEquals("JSB 11 Press"))
     {
+        h_mode = H_IDLE;
+        v_mode = V_IDLE;
+        forward_open_flag = 0;
+        rotate_180_open_flag = 0;
         Drv_PWM_HighLvTimeSet(&thruster[0],1750);
         Drv_PWM_HighLvTimeSet(&thruster[1],1750);
         Drv_PWM_HighLvTimeSet(&thruster[2],1750);
         Drv_PWM_HighLvTimeSet(&thruster[3],1750);
         Drv_PWM_HighLvTimeSet(&thruster[4],1750);
         Drv_PWM_HighLvTimeSet(&thruster[5],1750);
+        printf("ACK JSB 11 Press\r\n");
     }
     else if(CommandEquals("JSB 11 Release"))
     {
         thruster_all_stop();
+        printf("ACK JSB 11 Release\r\n");
+    }
+    else if(RaspberryPi_data[0] != '\0')
+    {
+        printf("ERR UNKNOWN_CMD %s\r\n", RaspberryPi_data);
     }
 }
 
@@ -288,6 +297,69 @@ static float AngleDifference(float target, float current)
     return diff;
 }
 
+static float AbsFloat(float value)
+{
+    return (value < 0.0f) ? -value : value;
+}
+
+static float GetYawDeg(void)
+{
+    return NormalizeAngle((float)JY901S.stcAngle.ConYaw);
+}
+
+static void UartPollAndParse(void)
+{
+    memset(RaspberryPi_data, 0, sizeof(RaspberryPi_data));
+
+    num = Drv_Uart_Receive_DMA(&Uart1, RaspberryPi_data);
+    if(num > 0)
+    {
+        if(num >= sizeof(RaspberryPi_data))
+        {
+            num = sizeof(RaspberryPi_data) - 1U;
+        }
+
+        RaspberryPi_data[num] = '\0';
+        thruster_start_open();
+    }
+}
+
+static void MotionUpdate(void)
+{
+    uint32_t now = HAL_GetTick();
+
+    if(h_mode == H_FORWARD)
+    {
+#if FORWARD_USE_YAW_HOLD
+        forward_yaw_hold_silent();
+#else
+        forward_open_loop_silent();
+#endif
+    }
+    else if(h_mode == H_TURN180)
+    {
+        update_turn180();
+    }
+
+    if(h_mode != H_IDLE && h_mode != H_TURN180)
+    {
+        if((now - h_start_tick) > H_ACTION_MAX_MS)
+        {
+            horizontal_stop();
+            printf("WARN H_TIMEOUT\r\n");
+        }
+    }
+
+    if(v_mode != V_IDLE)
+    {
+        if((now - v_start_tick) > V_ACTION_MAX_MS)
+        {
+            vertical_stop();
+            printf("WARN V_TIMEOUT\r\n");
+        }
+    }
+}
+
 static void NormalizeCommand(char *command)
 {
     char *start = command;
@@ -325,12 +397,338 @@ static void thruster_all_stop(void)
 {
     uint8_t i;
 
+    h_mode = H_IDLE;
+    v_mode = V_IDLE;
+    h_start_tick = 0U;
+    v_start_tick = 0U;
+    turn180_done_tick = 0U;
+
+    forward_open_flag = 0;
+    rotate_180_open_flag = 0;
+    forward_yaw_get_flag = 0;
+    right_rotate_180_get_flag = 0;
+    rotate_180_ready_count = 0;
+    PID_Clear(&PID);
+
     for(i = 0; i < 6; i++)
     {
         Drv_PWM_HighLvTimeSet(&thruster[i], 1500);
     }
+}
 
+static void horizontal_stop(void)
+{
+    h_mode = H_IDLE;
+    h_start_tick = 0U;
+    turn180_done_tick = 0U;
+    rotate_180_ready_count = 0;
     jy901_yaw_anti_rotation_cancel();
+}
+
+static void vertical_stop(void)
+{
+    v_mode = V_IDLE;
+    v_start_tick = 0U;
+    thruster_vertical_stop();
+}
+
+static void start_forward(void)
+{
+    jy901_yaw_anti_rotation_cancel();
+    forward_open_flag = 1;
+    rotate_180_open_flag = 0;
+    h_mode = H_FORWARD;
+    h_start_tick = HAL_GetTick();
+#if FORWARD_USE_YAW_HOLD
+    forward_yaw_get_flag = 0;
+    forward_yaw_hold_silent();
+#else
+    forward_open_loop_silent();
+#endif
+}
+
+static void start_backward(void)
+{
+    jy901_yaw_anti_rotation_cancel();
+    forward_open_flag = 0;
+    rotate_180_open_flag = 0;
+    h_mode = H_BACKWARD;
+    h_start_tick = HAL_GetTick();
+    thruster_horizontal_backward();
+}
+
+static void start_left(void)
+{
+    jy901_yaw_anti_rotation_cancel();
+    forward_open_flag = 0;
+    rotate_180_open_flag = 0;
+    h_mode = H_LEFT;
+    h_start_tick = HAL_GetTick();
+    thruster_horizontal_left_turn();
+}
+
+static void start_right(void)
+{
+    jy901_yaw_anti_rotation_cancel();
+    forward_open_flag = 0;
+    rotate_180_open_flag = 0;
+    h_mode = H_RIGHT;
+    h_start_tick = HAL_GetTick();
+    thruster_horizontal_right_turn();
+}
+
+static void start_up(void)
+{
+    v_mode = V_UP;
+    v_start_tick = HAL_GetTick();
+    thruster_vertical_up();
+}
+
+static void start_down(void)
+{
+    v_mode = V_DOWN;
+    v_start_tick = HAL_GetTick();
+    thruster_vertical_down();
+}
+
+static void start_turn180(void)
+{
+    jy901_yaw_anti_rotation_cancel();
+
+    forward_open_flag = 0;
+    rotate_180_open_flag = 0;
+    turn180_start_yaw = GetYawDeg();
+    turn180_target_yaw = NormalizeAngle(turn180_start_yaw + 180.0f);
+    turn_180_target = turn180_target_yaw;
+    turn180_done_tick = 0U;
+    rotate_180_ready_count = 0;
+    PID_Clear(&PID);
+
+    h_mode = H_TURN180;
+    h_start_tick = HAL_GetTick();
+
+    turn180_drive_silent(180.0f);
+    printf("ACK TURN180\r\n");
+}
+
+static void update_turn180(void)
+{
+    float current_yaw;
+    float err;
+    float abs_err;
+    uint32_t now;
+
+    if(h_mode != H_TURN180)
+    {
+        return;
+    }
+
+    now = HAL_GetTick();
+    if((now - h_start_tick) > TURN180_TIMEOUT_MS)
+    {
+        horizontal_stop();
+        printf("ERR TURN180 TIMEOUT\r\n");
+        return;
+    }
+
+    current_yaw = GetYawDeg();
+    err = AngleDifference(turn180_target_yaw, current_yaw);
+    abs_err = AbsFloat(err);
+
+    if(abs_err <= TURN180_DONE_DEG)
+    {
+        Drv_PWM_HighLvTimeSet(&thruster[0], 1500);
+        Drv_PWM_HighLvTimeSet(&thruster[1], 1500);
+
+        if(turn180_done_tick == 0U)
+        {
+            turn180_done_tick = now;
+        }
+
+        if((now - turn180_done_tick) >= TURN180_DONE_HOLD_MS)
+        {
+            horizontal_stop();
+            printf("DONE TURN180 %.2f\r\n", current_yaw);
+            return;
+        }
+    }
+    else
+    {
+        turn180_done_tick = 0U;
+    }
+
+    turn180_drive_silent(abs_err);
+}
+
+static void forward_yaw_hold_silent(void)
+{
+    float current_yaw;
+    float error;
+    float abs_err;
+    float derivative;
+    float p_term;
+    float i_term;
+    float d_term;
+    static float integral = 0.0f;
+    static float last_error = 0.0f;
+    static int last_output = 0;
+    static uint8_t large_err_latch = 0U;
+    int output;
+    int out_max;
+    int delta;
+
+    const float DEAD_ZONE = 0.8f;
+    const float INT_SEPARATION = 12.0f;
+    const float LARGE_ERROR = 25.0f;
+    const float INT_MAX = 250.0f;
+    const int OUT_MAX_SMALL = 120;
+    const int OUT_MAX_LARGE = 220;
+    const int MIN_EFFECTIVE = 30;
+    const int SLEW_RATE = 18;
+
+    if(forward_yaw_get_flag == 0)
+    {
+        forward_yaw_target = GetYawDeg();
+        forward_yaw_get_flag = 1;
+        integral = 0.0f;
+        last_error = 0.0f;
+        last_output = 0;
+        large_err_latch = 0U;
+        PID_Clear(&PID);
+    }
+
+    current_yaw = GetYawDeg();
+    error = -AngleDifference(forward_yaw_target, current_yaw);
+    abs_err = AbsFloat(error);
+
+    if(abs_err < DEAD_ZONE)
+    {
+        integral *= 0.95f;
+        last_error = error;
+
+        if(last_output > SLEW_RATE)
+            last_output -= SLEW_RATE;
+        else if(last_output < -SLEW_RATE)
+            last_output += SLEW_RATE;
+        else
+            last_output = 0;
+
+        left_offset = last_output;
+        right_offset = -last_output;
+        forward_adjust(left_offset, right_offset);
+        return;
+    }
+
+    if(abs_err > LARGE_ERROR)
+    {
+        if(!large_err_latch)
+        {
+            integral = 0.0f;
+            last_error = error;
+            large_err_latch = 1U;
+        }
+    }
+    else
+    {
+        large_err_latch = 0U;
+    }
+
+    if(abs_err < INT_SEPARATION)
+    {
+        integral += error;
+        if(integral > INT_MAX) integral = INT_MAX;
+        if(integral < -INT_MAX) integral = -INT_MAX;
+    }
+    else
+    {
+        integral *= 0.85f;
+    }
+
+    derivative = error - last_error;
+    last_error = error;
+
+    p_term = PID.fKp * error;
+    i_term = PID.fKi * integral;
+    d_term = PID.fKd * derivative;
+
+    output = (int)(p_term + i_term + d_term);
+
+    out_max = (abs_err > LARGE_ERROR) ? OUT_MAX_LARGE : OUT_MAX_SMALL;
+    if(output > out_max) output = out_max;
+    if(output < -out_max) output = -out_max;
+
+    delta = output - last_output;
+    if(delta > SLEW_RATE) output = last_output + SLEW_RATE;
+    if(delta < -SLEW_RATE) output = last_output - SLEW_RATE;
+    last_output = output;
+
+    if(output > 0 && output < MIN_EFFECTIVE) output = MIN_EFFECTIVE;
+    if(output < 0 && output > -MIN_EFFECTIVE) output = -MIN_EFFECTIVE;
+
+    yaw_output = output;
+    left_offset = output;
+    right_offset = -output;
+    forward_adjust(left_offset, right_offset);
+}
+
+#if !FORWARD_USE_YAW_HOLD
+static void forward_open_loop_silent(void)
+{
+    Drv_PWM_HighLvTimeSet(&thruster[0], FORWARD_LEFT_PWM);
+    Drv_PWM_HighLvTimeSet(&thruster[1], FORWARD_RIGHT_PWM);
+}
+#endif
+
+static void turn180_drive_silent(float abs_err)
+{
+    int pwm_delta;
+
+    if(abs_err >= TURN180_SLOW_DEG)
+    {
+        pwm_delta = TURN180_MAX_DELTA_PWM;
+    }
+    else
+    {
+        pwm_delta = TURN180_MIN_DELTA_PWM +
+                    (int)((TURN180_MAX_DELTA_PWM - TURN180_MIN_DELTA_PWM) *
+                          (abs_err / TURN180_SLOW_DEG));
+    }
+
+    if(pwm_delta < TURN180_MIN_DELTA_PWM)
+    {
+        pwm_delta = TURN180_MIN_DELTA_PWM;
+    }
+    else if(pwm_delta > TURN180_MAX_DELTA_PWM)
+    {
+        pwm_delta = TURN180_MAX_DELTA_PWM;
+    }
+
+    turn_by_pwm_silent(TURN180_ROTATE_RIGHT ? 1U : 0U, pwm_delta);
+}
+
+static void turn_by_pwm_silent(uint8_t turn_right, int pwm_delta)
+{
+    int left_pwm;
+    int right_pwm;
+
+    if(turn_right)
+    {
+        left_pwm = 1500 + pwm_delta;
+        right_pwm = 1500 - pwm_delta;
+    }
+    else
+    {
+        left_pwm = 1500 - pwm_delta;
+        right_pwm = 1500 + pwm_delta;
+    }
+
+    if(left_pwm < 1200) left_pwm = 1200;
+    if(left_pwm > 1800) left_pwm = 1800;
+    if(right_pwm < 1200) right_pwm = 1200;
+    if(right_pwm > 1800) right_pwm = 1800;
+
+    Drv_PWM_HighLvTimeSet(&thruster[0], left_pwm);
+    Drv_PWM_HighLvTimeSet(&thruster[1], right_pwm);
 }
 
 // 180度旋转主函数
@@ -406,6 +804,9 @@ void jy901_yaw_anti_rotate_open(void)
 // 关闭所有稳向功能，停止电机
 void jy901_yaw_anti_rotation_cancel(void)
 {
+    h_mode = H_IDLE;
+    h_start_tick = 0U;
+    turn180_done_tick = 0U;
     forward_yaw_get_flag = 0;
     right_rotate_180_get_flag = 0;
     PID_Clear(&PID);
