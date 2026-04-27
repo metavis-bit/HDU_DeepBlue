@@ -74,6 +74,7 @@ typedef enum
 #define FORWARD_USE_YAW_HOLD      1
 #define FORWARD_LEFT_PWM          1720
 #define FORWARD_RIGHT_PWM         1720
+#define FORWARD_RIGHT_BIAS_PWM    10
 #define FORWARD_DEADBAND_DEG      3.0f
 #define FORWARD_ADAPT_KP_START    2.0f
 #define FORWARD_ADAPT_KP_MIN      0.8f
@@ -825,7 +826,7 @@ void jy901_yaw_anti_rotation_cancel(void)
 // 直行稳向调整（基础1650推力 + PID纠偏）
 void forward_adjust(int left_offset,int right_offset)
 {
-    int right_pwm = 1700 + right_offset;
+    int right_pwm = 1700 + right_offset + FORWARD_RIGHT_BIAS_PWM;
     int left_pwm  = 1700 + left_offset;
 
     // PWM限幅保护
